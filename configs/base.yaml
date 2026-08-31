@@ -130,3 +130,36 @@ post_evolve:
   datasets:
     - name: "swebench-verified"
       n_concurrent: 24
+
+# ---------------------------------------------------------------------------
+# HCE: hypothesis-conditioned evaluation
+# ---------------------------------------------------------------------------
+# Replaces full-set evaluation of every candidate with a subset chosen from the
+# change's own declared trigger condition. `selector` picks the arm:
+#   full      every task, pi=1 -- the AHE baseline, and the special case the
+#             estimator reduces to algebraically
+#   variance  Poisson sampling weighted by historical Bernoulli variance
+#             (Task-CoEvolve); pi_min is the floor that keeps stable-pass tasks
+#             reachable, set it to 0 to reproduce the blind spot
+#   hce       activation set split into improvement / regression / audit
+hce:
+  enabled: false
+  selector: hce
+  seed: 42
+  budget_frac: 0.40            # of the training set, per iteration
+  global_budget_frac: 0.70     # when a change edits a globally visible file
+  split: {improvement: 0.19, regression: 0.41, audit: 0.40}
+  min_audit: 3                 # the audit stratum is what keeps every pi > 0
+  pi_min: 0.02
+  audit_enabled: true          # false only for the ablation
+  global_files: ["systemprompt.md", "code_agent.yaml"]
+  falsification:
+    enabled: true
+    min_predicted_match_frac: 0.5
+    min_activation: 1
+  gate:
+    enabled: true
+    tolerance: 0.02
+    max_hard_regressions: 2
+    on_contract_invalid: global_fallback
+  profiling: {k: 3, from_iteration: 1}

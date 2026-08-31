@@ -1,0 +1,78 @@
+_base: "../base.yaml"
+_name: "hce-tb2-42"
+_description: "HCE on the 42-task TB2 training half, 8 iterations, gpt-5.4-mini"
+_tags: ["hce", "tb2", "main"]
+
+source_config_dir: "agents/code_agent_simple"
+agent_config_filename: "code_agent.yaml"
+path: "../reset-free-coding-agent-harness/dataset/tb2-42-train"
+
+max_iterations: 8
+target_pass_rate: 1.01     # never stop early; the run is fixed at 8 iterations
+
+harbor:
+  k: 3                     # matches profiling, so x_i and p_hist share a denominator
+  # 84 = two full waves of the 42-task set at once, so iteration 1's 126 trials
+  # take roughly 1.5 waves instead of 3. The E2B account caps concurrent
+  # sandboxes at 100, and harbor does not retry a 429 on sandbox creation -- an
+  # over-quota trial is lost outright, not requeued -- so the 16 remaining slots
+  # are the safety margin and must not be spent on a second concurrent run.
+  n_concurrent: 84
+  e2b_sandbox_timeout: 26000
+  agent_import_path: "harbor_traced_agent:TracedNexAU"
+
+harbor_job_timeout_minutes: 240
+experiment_timeout_minutes: 1440
+
+llm:
+  api_key: "${LLM_API_KEY}"
+  base_url: "${LLM_BASE_URL}"
+  model: "gpt-5.4-mini"
+
+code_agent_patch:
+  tool_call_mode: openai
+  llm_config:
+    api_type: openai_responses
+    additional_drop_params: ["temperature", "top_p"]
+    reasoning:
+      effort: "medium"
+
+evolve_agent:
+  tool_call_mode: openai
+  llm_config:
+    api_key: "${LLM_API_KEY}"
+    base_url: "${LLM_BASE_URL}"
+    model: "gpt-5.4-mini"
+    api_type: openai_responses
+    additional_drop_params: ["temperature", "top_p"]
+    reasoning:
+      effort: "medium"
+
+explore_agent:
+  enabled: false
+
+agent_debugger:
+  enabled: true
+  max_concurrent: 8
+  max_tasks: 20
+  llm:
+    api_key: "${ADB_LLM_API_KEY}"
+    base_url: "${ADB_LLM_BASE_URL}"
+    model: "gpt-5.4-mini"
+
+post_evolve:
+  enabled: false
+
+notify:
+  enabled: false
+
+hce:
+  enabled: true
+  selector: hce
+  seed: 42
+  budget_frac: 0.40
+  global_budget_frac: 0.70
+  split: {improvement: 0.19, regression: 0.41, audit: 0.40}
+  min_audit: 6             # measured: at min_audit=3 one audit flip moves the
+                           # estimate ~7.7pp, larger than the effects sought
+  profiling: {k: 3, from_iteration: 1}

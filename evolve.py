@@ -14,6 +14,7 @@ import argparse
 import collections
 import concurrent.futures
 import copy
+import hashlib
 import json
 import math
 import os
@@ -31,12 +32,78 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+import usage_report
+from hce import runtime as hce_runtime
+from hce.profiles import TaskProfileDB
+from hce import gate as hce_gate
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PROJECT_DIR = Path(__file__).resolve().parent
 EVOLVE_AGENT_DIR = PROJECT_DIR / "agents" / "evolve_agent"
 EXPERIMENTS_DIR = PROJECT_DIR / "experiments"
 
+# Captured before load_dotenv because that call passes override=True: without this,
+# a provider chosen in the shell (`LLM_PROVIDER=scale ...`) would be silently
+# replaced by whatever .env happens to say, and the run would quietly bill the wrong
+# account. Shell wins; .env supplies the default when the shell says nothing.
+_SHELL_LLM_PROVIDER = os.environ.get("LLM_PROVIDER")
+
 load_dotenv(PROJECT_DIR / ".env", override=True)
+
+
+def _resolve_llm_provider() -> str | None:
+    """Point LLM_API_KEY/LLM_BASE_URL (and the Agent Debugger's own pair) at one of
+    several named providers held side by side in .env.
+
+    .env keeps plain LLM_API_KEY/LLM_BASE_URL as the default, so nothing changes for
+    anyone who never sets LLM_PROVIDER -- this only takes effect when a provider is
+    named, and only for the variables that provider actually defines. Naming a
+    provider with no <NAME>_LLM_API_KEY in .env is an error rather than a silent
+    fallback to the default account.
+
+    Providers currently in use:
+      umd   -- the original account; api_type openai_responses; 400s on
+               temperature/top_p once reasoning.effort is set, which is what
+               additional_drop_params in the experiment configs exists for.
+      scale -- Scale AI's LiteLLM proxy. Base URL must include the /v1 suffix
+               (without it every request 403s). Serves /v1/responses with the same
+               usage schema (input_tokens / input_tokens_details.cached_tokens /
+               output_tokens_details.reasoning_tokens), so UsageTracer and
+               usage_report price it unchanged. It tolerates temperature alongside
+               reasoning rather than 400ing, but the configs keep dropping both
+               params anyway so the request payload stays identical across
+               providers and the arms remain comparable.
+    """
+    provider = (_SHELL_LLM_PROVIDER or os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    # "default" names the plain LLM_API_KEY/LLM_BASE_URL pair. The runner scripts
+    # require LLM_PROVIDER to be set explicitly rather than defaulting, so
+    # "default" is how a caller asks for the .env pair on purpose -- and
+    # run_benchmark100_all.sh exports the same value to both arms, so this has to
+    # mean here what it means in run_benchmark100_baseline.sh.
+    if not provider or provider == "default":
+        return None
+    prefix = provider.upper()
+    key = os.environ.get(f"{prefix}_LLM_API_KEY")
+    if not key:
+        raise SystemExit(
+            f"[env] LLM_PROVIDER={provider!r} 但 .env 中没有 {prefix}_LLM_API_KEY。"
+            f"可用的 provider 取决于 .env 中定义了哪些 <NAME>_LLM_API_KEY。"
+        )
+    os.environ["LLM_API_KEY"] = key
+    for suffix in ("LLM_BASE_URL", "LLM_MODEL"):
+        val = os.environ.get(f"{prefix}_{suffix}")
+        if val:
+            os.environ[suffix] = val
+    # Agent Debugger reads its own pair (base.yaml's agent_debugger.llm); fall back
+    # to the main ones so a provider only has to define ADB_* when it differs.
+    os.environ["ADB_LLM_API_KEY"] = os.environ.get(f"{prefix}_ADB_LLM_API_KEY") or key
+    adb_url = os.environ.get(f"{prefix}_ADB_LLM_BASE_URL") or os.environ.get(f"{prefix}_LLM_BASE_URL")
+    if adb_url:
+        os.environ["ADB_LLM_BASE_URL"] = adb_url
+    return provider
+
+
+_ACTIVE_LLM_PROVIDER = _resolve_llm_provider()
 
 _ENV_KEYS = [
     "GITHUB_TOKEN", "E2B_API_KEY", "E2B_API_URL", "E2B_DOMAIN",
@@ -252,6 +319,77 @@ def set_llm_env(llm_cfg: dict) -> None:
             os.environ[env_key] = val
 
 
+_FINGERPRINT_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache"}
+_FINGERPRINT_SKIP_SUFFIXES = (".pyc", ".pyo")
+
+
+def harness_fingerprint(workspace_dir: Path) -> str:
+    """Content-addressed hash of the whole workspace (paths plus bytes).
+
+    When the evolve agent -- or the gate -- undoes an ineffective change, the
+    harness returns byte for byte to a state that has already been evaluated.
+    Re-evaluating it is not merely wasted money, it produces an actively wrong
+    signal: two evaluations of the same harness differ by a few tasks anyway,
+    and that difference gets read as the effect of the rollback. A run in the
+    sibling repository had iteration 5's workspace identical to iteration 3's
+    and scored them 27/50 and 29/50, four points apart.
+
+    Keyed on content rather than on an iteration number or a git SHA, so it also
+    catches the case where two different edit paths arrive at the same tree.
+    """
+    h = hashlib.sha256()
+    for path in sorted(workspace_dir.rglob("*")):
+        rel = path.relative_to(workspace_dir)
+        if any(part in _FINGERPRINT_SKIP_DIRS for part in rel.parts):
+            continue
+        if path.suffix in _FINGERPRINT_SKIP_SUFFIXES or not path.is_file():
+            continue
+        h.update(str(rel).encode("utf-8"))
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def load_harness_index(exp_dir: Path) -> dict:
+    """fingerprint -> {iteration, job_dir, per_task_score, evaluated_tasks}.
+
+    Per-task rather than per-job, unlike the sibling's version: HCE evaluates a
+    subset, so carrying a whole job forward would present a twelve-task result
+    as if it covered the training set.
+    """
+    src = exp_dir / "harness_index.json"
+    if not src.exists():
+        return {}
+    try:
+        return json.loads(src.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_harness_index(exp_dir: Path, index: dict) -> None:
+    (exp_dir / "harness_index.json").write_text(
+        json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def point_usage_log_at(path: Path) -> None:
+    """Aim UsageTracer -- registered in each agent's yaml `tracers:` -- at `path`.
+
+    Host-side agents (evolve_agent, explore_agent) are built in this very process,
+    and the tracer resolves its destination once, in __init__, i.e. during
+    Agent.from_yaml(). Calling this immediately before each construction is what
+    keeps one agent's calls out of another's file; a single env var set once at
+    startup would pool them all together. Sandbox-side code_agent has no such
+    launcher and takes an absolute path param in its yaml instead.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["NEXAU_USAGE_LOG"] = str(path)
+    except OSError as exc:
+        # Cost accounting must never be the reason an iteration fails.
+        print(f"[usage] cannot record to {path}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Phase 0: Create Experiment Directory + Initialize Workspace
 # ---------------------------------------------------------------------------
@@ -303,8 +441,24 @@ def create_experiment_dir(config: dict, config_path: str, experiment_name: str |
     return exp_dir
 
 
-def init_workspace(source_dir: Path, workspace_dir: Path) -> bool:
-    """Copy from source config directory to workspace and git init. Returns whether a new initialization was performed."""
+def init_workspace(source_dir: Path, workspace_dir: Path,
+                   pre_commit=None) -> bool:
+    """Copy the seed harness into the workspace and git-init it.
+
+    `pre_commit` runs after the copy but *before* the baseline commit, and is
+    where experiment-level patches belong (reasoning effort,
+    additional_drop_params, and anything else that is a controlled variable).
+    The ordering is load-bearing.
+
+    Patching after the commit leaves the workspace permanently dirty, so every
+    iteration hands the evolve agent a `git status` showing an undeclared
+    modification to the very file the prompt tells it never to touch. In the
+    sibling repository the agent did the only consistent thing available and
+    rewrote code_agent.yaml until the tree was clean, which restored the file to
+    its committed -- unpatched -- content and silently dropped reasoning.effort.
+    The remaining iterations ran with no reasoning budget at all and the pass
+    rate went from 60% to 24%.
+    """
     if workspace_dir.exists() and (workspace_dir / ".git").exists():
         print(f"[init] Workspace already exists with git history, skipping initialization")
         return False
@@ -315,12 +469,19 @@ def init_workspace(source_dir: Path, workspace_dir: Path) -> bool:
 
     shutil.copytree(source_dir, workspace_dir)
 
+    if pre_commit is not None:
+        pre_commit(workspace_dir)
+
     subprocess.run(["git", "init"], cwd=workspace_dir, check=True, capture_output=True)
     subprocess.run(["git", "add", "-A"], cwd=workspace_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "v0: baseline from " + source_dir.name],
         cwd=workspace_dir, check=True, capture_output=True,
     )
+    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=workspace_dir,
+                           capture_output=True, text=True).stdout.strip()
+    if dirty:
+        print(f"[init] WARNING: workspace is dirty right after the baseline commit:\n{dirty}")
     print(f"[init] Workspace initialization complete, baseline committed")
     return True
 
@@ -406,9 +567,15 @@ def _build_harbor_cmd(config: dict, workspace_dir: Path, agent_config_filename: 
     k = int(harbor_cfg.get("k", 1))
     n_concurrent = n_concurrent_override or harbor_cfg["n_concurrent"]
 
+    # An import path selects a Python class instead of a registered agent name.
+    # TracedNexAU subclasses harbor's NexAU and only adds the usage tracer, so
+    # evaluation behaviour is unchanged while code_agent spend becomes visible.
+    agent_import_path = harbor_cfg.get("agent_import_path")
+    agent_flag = (["--agent-import-path", agent_import_path] if agent_import_path
+                  else ["--agent", harbor_cfg["agent"]])
     cmd = [
         "harbor", "run",
-        "--agent", harbor_cfg["agent"],
+        *agent_flag,
         "--env", harbor_cfg["env"],
         "--model", model,
         "--n-concurrent", str(n_concurrent),
@@ -462,6 +629,19 @@ def launch_harbor(config: dict, workspace_dir: Path, agent_config_filename: str,
     e2b_sandbox_timeout = config["harbor"].get("e2b_sandbox_timeout")
     if e2b_sandbox_timeout is not None:
         sub_env["E2B_SANDBOX_TIMEOUT"] = str(int(e2b_sandbox_timeout))
+
+    # harbor resolves --agent-import-path with importlib, and harbor itself is a
+    # console-script entry point, so PROJECT_DIR must be importable there.
+    existing_pythonpath = sub_env.get("PYTHONPATH", "")
+    sub_env["PYTHONPATH"] = (f"{PROJECT_DIR}{os.pathsep}{existing_pythonpath}"
+                             if existing_pythonpath else str(PROJECT_DIR))
+
+    # harbor is a console script inside the project venv, and the subprocess runs
+    # from ROOT_DIR, so its bin directory has to be on PATH explicitly -- running
+    # evolve.py as .venv/bin/python does not put it there.
+    venv_bin = Path(sys.executable).parent
+    if (venv_bin / "harbor").exists():
+        sub_env["PATH"] = f"{venv_bin}{os.pathsep}{sub_env.get('PATH', '')}"
 
     prev_latest = find_latest_job_dir(iteration_dir)
     started_after = prev_latest.name if prev_latest else ""
@@ -669,7 +849,10 @@ def compute_stats(job_dir: Path, k: int = 1) -> dict:
         else:
             task_results[task_name] = "fail"
 
-        if k > 1:
+        # Filled unconditionally: subset selection and the estimator both need
+        # per-task rollout counts at k=1 as well, and downstream readers already
+        # treat an absent task as "no rollouts recorded".
+        if True:
             per_task_rollouts[task_name] = {
                 "n_pass": tp,
                 "n_fail": tf,
@@ -720,10 +903,12 @@ def compute_stats(job_dir: Path, k: int = 1) -> dict:
         "exception_types": exception_types,
         "task_results": task_results,
         "timeout_tasks": timeout_tasks,
+        # Always present: subset selection and the estimator need per-task
+        # rollout counts at k=1 too.
+        "per_task_rollouts": per_task_rollouts,
     }
 
     if k > 1:
-        result["per_task_rollouts"] = per_task_rollouts
         result["pass_at_k"] = pass_at_k_metrics
         result["trial_stats"] = {
             "n_pass": trial_n_pass,
@@ -829,7 +1014,8 @@ def compute_task_stability(task_history: dict, min_iterations: int = 3) -> dict:
 
 def compute_iteration_diff(current_results: dict, prev_results: dict | None,
                            current_rollouts: dict | None = None,
-                           prev_rollouts: dict | None = None) -> dict | None:
+                           prev_rollouts: dict | None = None,
+                          evaluated: set[str] | None = None) -> dict | None:
     """Compare current and previous iteration task results, compute the full 9-state transition matrix.
 
     When rollout data is available (k>1), also subdivides stable_fail into
@@ -857,6 +1043,11 @@ def compute_iteration_diff(current_results: dict, prev_results: dict | None,
     has_rollouts = bool(current_rollouts and prev_rollouts)
 
     all_tasks = set(current_results) | set(prev_results)
+    if evaluated is not None:
+        # Under subset evaluation most tasks simply were not run this iteration.
+        # Without this mask they default to "exception" below and every skipped
+        # task is reported to the evolve agent as a fresh infrastructure failure.
+        all_tasks &= set(evaluated)
     for task in sorted(all_tasks):
         cur = current_results.get(task, "exception")
         prev = prev_results.get(task, "exception")
@@ -1400,8 +1591,38 @@ def _invoke_adb_ask_once(cmd: list[str], env: dict[str, str], timeout: float) ->
         return f"[adb exception] {e}"
 
 
+ASK_MODE_HINT = (
+    "OUTPUT MODE: this is an `ask` request. Your single `complete_task` call must carry "
+    'EXACTLY {"mode":"ask","answer":"<your full analysis as one string>"}. '
+    "Do NOT emit the `check` schema (no `issues` array)."
+)
+
+# Only model identifiers observed to need it. adb dispatches on two payload
+# schemas -- ask and check -- and gpt-5.4-mini returns the check payload for an
+# ask request, at which point adb's runner raises on payload["answer"] and the
+# task's analysis is lost. Measured on this repo: every trial failed with
+# "ask payload missing string `answer`" until the hint was added.
+DEFAULT_ASK_HINT_MODEL_PATTERNS = ("mini",)
+
+
+def _needs_ask_mode_hint(config: dict) -> bool:
+    """agent_debugger.ask_mode_hint: auto (default, decide by model) | always | never."""
+    setting = str(config.get("ask_mode_hint", "auto")).strip().lower()
+    if setting in ("always", "on", "true", "yes"):
+        return True
+    if setting in ("never", "off", "false", "no"):
+        return False
+    model = ((config.get("llm") or {}).get("model")
+             or os.environ.get("QA_MODEL_NAME")
+             or os.environ.get("LLM_MODEL")
+             or "").lower()
+    patterns = config.get("ask_hint_model_patterns") or DEFAULT_ASK_HINT_MODEL_PATTERNS
+    return any(str(pat).strip().lower() in model for pat in patterns)
+
+
 def _run_single_adb_ask(job: TaskAnalysisJob, config: dict, k: int = 1,
-                        extra_query_prefix: str = "") -> dict:
+                        extra_query_prefix: str = "",
+                        usage_dir: Path | None = None) -> dict:
     """Run `adb ask` for one task and return result dict."""
     n_total = job.n_pass + job.n_fail + job.n_timeout
 
@@ -1461,12 +1682,25 @@ def _run_single_adb_ask(job: TaskAnalysisJob, config: dict, k: int = 1,
         query = extra_query_prefix + "\n" + query
 
     adb = _adb_path or "adb"
+    # Last line of the query on purpose: it is the final instruction the model
+    # reads before answering.
+    if _needs_ask_mode_hint(config):
+        query += "\n\n" + ASK_MODE_HINT
+
     cmd = [adb, "ask", "-t"] + [str(p) for p in job.trace_paths]
     if job.trace_type:
         cmd += ["--trace-type", job.trace_type]
     cmd += ["-q", query, "--format", "json"]
 
     env = os.environ.copy()
+    if usage_dir is not None:
+        # One file per task: these run concurrently, and a shared path would
+        # interleave records from different tasks in the same file.
+        try:
+            usage_dir.mkdir(parents=True, exist_ok=True)
+            env["NEXAU_USAGE_LOG"] = str(usage_dir / f"{job.task_name}.jsonl")
+        except OSError as exc:
+            print(f"[usage] cannot record adb usage for {job.task_name}: {exc}")
     llm_cfg = config.get("llm", {})
     if llm_cfg.get("model"):
         env["QA_MODEL_NAME"] = llm_cfg["model"]
@@ -1754,7 +1988,8 @@ def run_parallel_adb_ask(
 
     # Run the first job serially to warm up adb's internal venv (~/.adb/venvs/),
     # avoiding race conditions when multiple workers create it simultaneously.
-    first_result = _run_single_adb_ask(jobs[0], config, k=k)
+    adb_usage_dir = iteration_dir / "usage" / "agent_debugger"
+    first_result = _run_single_adb_ask(jobs[0], config, k=k, usage_dir=adb_usage_dir)
     status = "ok" if not first_result["response"].startswith("[adb") else "err"
     print(f"  [{status}] {jobs[0].task_name} ({jobs[0].mode}) [warmup]")
     results: list[dict] = [first_result]
@@ -1763,7 +1998,8 @@ def run_parallel_adb_ask(
     if remaining_jobs:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_map = {
-                pool.submit(_run_single_adb_ask, job, config, k=k): job
+                pool.submit(_run_single_adb_ask, job, config, k=k,
+                            usage_dir=adb_usage_dir): job
                 for job in remaining_jobs
             }
             for future in concurrent.futures.as_completed(future_map):
@@ -1972,6 +2208,41 @@ def update_history_after(exp_dir: Path, iteration: int, evolve_result: str) -> N
 # Phase 2.6: Update iteration_scores
 # ---------------------------------------------------------------------------
 
+def write_cost_summary(exp_dir: Path) -> dict | None:
+    """Write the run's own per-role token and cost breakdown to cost_summary.json.
+
+    The classic AHE loop had no cost accounting of any kind: step-evolve wrote
+    step_evolve_summary.json with a total, while a run through here left its usage
+    records on disk and nothing that added them up. That made the number depend on
+    remembering to run scripts/price_run.py afterwards, and unrecoverable once the
+    gitignored experiments/ directory was cleaned up.
+
+    Same arithmetic as that script -- both call usage_report -- so a run's own
+    figure and a later audit of it cannot disagree.
+    """
+    try:
+        summary = usage_report.summarize(exp_dir)
+    except Exception as exc:  # noqa: BLE001 - accounting must not fail a run
+        print(f"[cost] could not summarize usage: {exc}")
+        return None
+
+    if not summary["by_role"]:
+        return None
+
+    path = exp_dir / "cost_summary.json"
+    path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    parts = " ".join(
+        f"{role}=${b['cost_usd']:.2f}" for role, b in summary["by_role"].items()
+    )
+    label = " (lower bound)" if summary["is_lower_bound"] else ""
+    print(f"[cost] {parts} total=${summary['total_usd']:.2f}{label} -> {path.name}")
+    if summary["n_unmeasured_calls"]:
+        print(f"[cost] {summary['n_unmeasured_calls']} call(s) could not be priced "
+              f"-- reported spend is a floor, not a figure")
+    return summary
+
+
 def update_iteration_scores(exp_dir: Path, config: dict, iteration: int,
                             pass_rate: float, n_pass: int, n_total: int,
                             job_dir: Path, *,
@@ -2006,6 +2277,38 @@ def update_iteration_scores(exp_dir: Path, config: dict, iteration: int,
 
     if timing:
         entry["timing"] = timing
+
+    # Per-iteration spend belongs next to pass_rate: the two are read together
+    # when judging whether an iteration was worth what it cost. explore_agent is
+    # excluded -- it runs once per experiment, not per iteration -- and appears
+    # only in the run-level cost_summary.json.
+    iter_usage_root = exp_dir / "runs" / f"iteration_{iteration:03d}"
+    if iter_usage_root.exists():
+        try:
+            iter_cost = usage_report.summarize(iter_usage_root)
+            if iter_cost["by_role"]:
+                entry["cost"] = {
+                    "by_role": {r: round(b["cost_usd"], 6)
+                                for r, b in sorted(iter_cost["by_role"].items())},
+                    "total_usd": round(iter_cost["total_usd"], 6),
+                    "is_lower_bound": iter_cost["is_lower_bound"],
+                }
+        except Exception as exc:  # noqa: BLE001 - accounting must not fail a run
+            print(f"[cost] iteration {iteration} usage not summarized: {exc}")
+
+    if stats and "global_estimate" in stats:
+        # Recorded beside pass_rate because they are not the same quantity: the
+        # subset rate is over whichever tasks were selected, the estimate is the
+        # comparable one and the one the gate ruled on.
+        entry["hce"] = {
+            "global_estimate": round(stats["global_estimate"], 6),
+            "subset_pass_rate": round(stats.get("subset_pass_rate", 0.0), 6),
+            "n_evaluated": len(stats.get("task_results") or {}),
+        }
+        for field in ("selector", "mode", "budget_rollouts", "se", "gate_verdict",
+                      "gate_rule", "n_dropped_infra"):
+            if stats.get(f"hce_{field}") is not None:
+                entry["hce"][field] = stats[f"hce_{field}"]
 
     if bon_variants:
         entry["bon_variants"] = bon_variants
@@ -2361,16 +2664,22 @@ def save_best_ever(exp_dir: Path, best: dict) -> None:
 def update_best_ever(exp_dir: Path, iteration: int, stats: dict) -> dict:
     """Update best-ever with current iteration, return latest best-ever info."""
     current = load_best_ever(exp_dir)
-    pass_rate = stats["pass_rate"]
+    # Under subset evaluation `pass_rate` covers only the tasks that were
+    # selected, so it is not comparable across iterations. The IPW estimate is,
+    # and it is what the gate ruled on, so it is what "best" has to mean.
+    pass_rate = stats.get("global_estimate", stats["pass_rate"])
 
     if current is None or pass_rate > current.get("pass_rate", current.get("capability_rate", 0)):
         k = stats.get("k", 1)
         n_total = stats["n_pass"] + stats["n_fail"] + stats["n_exception"]
         best = {
             "iteration": iteration,
-            "pass_rate": stats["pass_rate"],
+            "pass_rate": pass_rate,
             "k": k,
         }
+        if "global_estimate" in stats:
+            best["subset_pass_rate"] = stats.get("subset_pass_rate")
+            best["metric"] = "hce_ipw_estimate"
         if k > 1:
             per_task_rollouts = stats.get("per_task_rollouts", {})
             task_results = stats.get("task_results", {})
@@ -3037,6 +3346,7 @@ def run_evolve_agent(config: dict, exp_dir: Path, iteration: int,
 
     from nexau import Agent
 
+    point_usage_log_at(iteration_dir / "usage" / "evolve_agent.jsonl")
     agent = Agent.from_yaml(config_path=evolve_config_path)
 
     evolve_log_dir = iteration_dir / "evolve"
@@ -3373,6 +3683,7 @@ def run_evolve_agent_on_variant(config: dict, exp_dir: Path,
 
     from nexau import Agent
 
+    point_usage_log_at(iteration_dir / "usage" / f"evolve_agent_{variant_label}.jsonl")
     agent = Agent.from_yaml(config_path=evolve_config_path)
 
     variant_evolve_dir = iteration_dir / "evolve" / variant_label
@@ -4074,6 +4385,7 @@ def _run_explore_agent_standalone(config: dict, exp_dir: Path) -> None:
         config = deep_merge(config, {"explore_agent_patch": ml_agent_patch})
 
     print(f"\n[explore-agent] Starting explore-agent (model={ml_model})...")
+    point_usage_log_at(exp_dir / "usage" / "explore_agent.jsonl")
     ml_success = run_explore_agent(config, exp_dir)
     if ml_success:
         print("[explore-agent] Done, skills ready")
@@ -4159,7 +4471,11 @@ def run_single_experiment(config: dict, config_path: str, experiment_name: str |
     exp_dir = create_experiment_dir(config, config_path, experiment_name=experiment_name)
     workspace_dir = exp_dir / "workspace"
 
-    is_new = init_workspace(source_dir, workspace_dir)
+    is_new = init_workspace(
+        source_dir, workspace_dir,
+        pre_commit=(lambda ws: apply_code_agent_patch(ws, agent_config_filename,
+                                                      code_agent_patch))
+        if code_agent_patch else None)
 
     # Phase 0.05: On resume, restore workspace and experiment metadata to the start iteration's state
     if not is_new and start_iteration > 1:
@@ -4173,8 +4489,8 @@ def run_single_experiment(config: dict, config_path: str, experiment_name: str |
 
     # Phase 0.1: Apply patches
     if is_new:
-        # Fresh init: apply full patches (tool_call_mode, api_type, reasoning, etc.)
-        apply_code_agent_patch(workspace_dir, agent_config_filename, code_agent_patch)
+        # code_agent_patch was already applied by init_workspace's pre_commit, so
+        # it is part of the baseline commit rather than an uncommitted edit.
         apply_agent_yaml_patch(exp_dir / "evolve_agent" / "evolve_agent.yaml", evolve_agent_patch, label="evolve_agent_patch")
     else:
         # Resume: re-apply LLM connection config from the current CLI yaml
@@ -4199,6 +4515,22 @@ def run_single_experiment(config: dict, config_path: str, experiment_name: str |
     evolve_llm_cfg = get_llm_config(config, role="evolve")
     meta_name = config.get("_meta", {}).get("_name", "")
     exp_k = int(config.get("harbor", {}).get("k", 1))
+
+    hce_cfg = hce_runtime.settings(config)
+    hce_on = bool(hce_cfg["enabled"])
+    hce_db = TaskProfileDB.load(exp_dir / "task_profiles.json")
+    hce_db.dataset = hce_db.dataset or str(config.get("path") or config.get("dataset") or "")
+    # N for the estimator comes from the dataset directory, not from the last
+    # job: under subset evaluation the latter is whatever happened to be run.
+    hce_all_tasks = hce_runtime.dataset_tasks(config, PROJECT_DIR)
+    hce_dataset_dir = None
+    if config.get("path"):
+        _p = Path(config["path"])
+        hce_dataset_dir = _p if _p.is_absolute() else (PROJECT_DIR / _p).resolve()
+    hce_s_ref: float | None = None
+    if hce_on:
+        print(f"[hce] selector={hce_cfg['selector']} budget_frac={hce_cfg['budget_frac']} "
+              f"N={len(hce_all_tasks)} k={exp_k} profiles={len(hce_db.tasks)}")
     print(f"\n{'='*60}")
     print(f"Agentic Harness Engineering Automated Evolution System")
     print(f"Experiment directory: {exp_dir.name}")
@@ -4273,6 +4605,68 @@ def run_single_experiment(config: dict, config_path: str, experiment_name: str |
             else:
                 print(f"[snapshot] Workspace snapshot already exists, skipping")
 
+            # Phase 1a: HCE subset selection.
+            # Runs before evaluation because its whole purpose is to decide what
+            # gets evaluated. Reads the contract the evolve agent wrote at the
+            # end of the previous iteration -- the loop is staggered, so the
+            # harness measured at the top of iteration t is the one produced at
+            # the end of t-1, and the same manifest drives both selection here
+            # and attribution later.
+            hce_plan = None
+            hce_reused: dict[str, float] = {}
+            hce_fp = ""
+            hce_iter_dir = iteration_dir / "hce"
+            if hce_on:
+                hce_fp = harness_fingerprint(workspace_dir)
+            if hce_on and hce_db.tasks:
+                _prompt_src = exp_dir / "evolve_agent" / "evolve_prompt.md"
+                if _prompt_src.exists():
+                    _text = _prompt_src.read_text(encoding="utf-8")
+                    if "<!-- HCE_FEATURE_TABLE -->" in _text:
+                        _prompt_src.write_text(
+                            _text.replace("<!-- HCE_FEATURE_TABLE -->",
+                                          hce_runtime.prompt_section(hce_db, hce_all_tasks)),
+                            encoding="utf-8")
+            if hce_on and hce_all_tasks:
+                hce_plan = hce_runtime.plan_iteration(
+                    config=config, exp_dir=exp_dir, project_dir=PROJECT_DIR,
+                    iteration=iteration, db=hce_db, all_tasks=hce_all_tasks)
+                hce_plan.record["fingerprint"] = hce_fp
+                # Per-task reuse: any task already measured under this exact
+                # harness is dropped from the subset and its stored score is
+                # merged back in. After a revert the tree returns to a
+                # fingerprint already on file, so the next evaluation of it is
+                # largely free -- which is precisely the cost the classic loop
+                # paid twice.
+                _index = load_harness_index(exp_dir)
+                _entry = _index.get(hce_fp) or {}
+                _stored = _entry.get("per_task_score") or {}
+                if _stored:
+                    hce_reused = {t: v for t, v in _stored.items()
+                                  if t in set(hce_plan.task_names)}
+                    if hce_reused:
+                        hce_plan.task_names = [t for t in hce_plan.task_names
+                                               if t not in hce_reused]
+                        print(f"[hce] reusing {len(hce_reused)} task result(s) measured "
+                              f"under this same harness at iteration {_entry.get('iteration')}; "
+                              f"{len(hce_plan.task_names)} left to run")
+                hce_plan.record["reused_from"] = (
+                    {"iteration": _entry.get("iteration"), "tasks": sorted(hce_reused)}
+                    if hce_reused else None)
+                hce_runtime.write_json(hce_iter_dir / "selection.json", hce_plan.record)
+                r = hce_plan.record
+                print(f"[hce] iteration {iteration}: selector={r['selector']} mode={r['mode']} "
+                      f"{len(hce_plan.task_names)}/{r['n_tasks_total']} tasks "
+                      f"= {r['budget_rollouts']} rollouts")
+                for name, st in r["strata"].items():
+                    print(f"[hce]   {name:<7} pool={len(st['pool']):>3} taken={len(st['taken']):>3} "
+                          f"pi={st['pi']}")
+                if r["contract_error"]:
+                    print(f"[hce] contract unusable, falling back: {r['contract_error']}")
+                if hce_plan.pre_rejected:
+                    print(f"[hce] falsification REJECTED before any rollout: "
+                          f"{hce_plan.falsification.reason}")
+
             # Phase 1: Evaluation
             _phase1_start = time.monotonic()
             # When Best-of-N is enabled and we have a winner from the previous iteration,
@@ -4315,7 +4709,13 @@ def run_single_experiment(config: dict, config_path: str, experiment_name: str |
                             config, exp_dir, workspace_dir, agent_config_filename, benchmark_dir,
                         )
                     else:
-                        job_dir = run_harbor(config, workspace_dir, agent_config_filename, benchmark_dir)
+                        eval_config = config
+                        if hce_plan is not None and hce_plan.task_names:
+                            # A per-iteration copy, exactly as run_post_evolve does:
+                            # task_names becomes harbor's -t flags.
+                            eval_config = copy.deepcopy(config)
+                            eval_config["task_names"] = list(hce_plan.task_names)
+                        job_dir = run_harbor(eval_config, workspace_dir, agent_config_filename, benchmark_dir)
                 except HarborJobTimeoutError as e:
                     print(f"\n[timeout] {e}")
                     print(f"[timeout] No available evaluation results, skipping this iteration")
@@ -4370,7 +4770,9 @@ def run_single_experiment(config: dict, config_path: str, experiment_name: str |
 
             diff = compute_iteration_diff(stats["task_results"], prev_task_results,
                                           current_rollouts=stats.get("per_task_rollouts"),
-                                          prev_rollouts=prev_rollouts)
+                                          prev_rollouts=prev_rollouts,
+                                          evaluated=(set(stats["task_results"])
+                                                     if hce_plan is not None else None))
 
             update_history_before(exp_dir, iteration, stats, job_dir, diff=diff)
 
@@ -4389,10 +4791,97 @@ def run_single_experiment(config: dict, config_path: str, experiment_name: str |
                 else:
                     print(f"[attribution] No change_manifest.json found for iteration {iteration-1}, skipping change attribution")
 
+            # Phase 2.75: HCE estimate and automatic gate.
+            # Replaces "rollback decided by evolve agent": under subset
+            # evaluation the decision rests on an estimate with a known sampling
+            # design, which is not something to delegate to a model reading a
+            # markdown table.
+            hce_estimate = None
+            hce_decision = None
+            if hce_plan is not None:
+                hce_measured = hce_runtime.measure(
+                    job_dir,
+                    max_iterations=int(config.get("code_agent_patch", {})
+                                       .get("max_iterations", 300) or 300),
+                    max_context_tokens=int(config.get("code_agent_patch", {})
+                                           .get("max_context_tokens", 200000) or 200000),
+                    dataset_dir=hce_dataset_dir)
+                for _task, _score in hce_reused.items():
+                    hce_measured.setdefault(_task, {
+                        "score": _score, "agg": hce_db.mechanisms([_task])[_task],
+                        "per_rollout": [], "n_pass": 0, "n_fail": 0, "n_infra": 0,
+                        "mean_usd": None, "reused": True})
+                _index = load_harness_index(exp_dir)
+                _entry = _index.setdefault(hce_fp, {"iteration": iteration,
+                                                    "job_dir": str(job_dir),
+                                                    "per_task_score": {}})
+                _entry["per_task_score"].update(
+                    {t: m["score"] for t, m in hce_measured.items() if m["score"] is not None})
+                _entry["evaluated_tasks"] = sorted(_entry["per_task_score"])
+                save_harness_index(exp_dir, _index)
+
+                if hce_plan.pre_rejected:
+                    hce_estimate, _ = hce_runtime.score_iteration(
+                        plan=hce_plan, measured=hce_measured, s_ref=hce_s_ref, config=config)
+                    hce_decision = hce_gate.GateDecision(
+                        hce_gate.REJECT, "F_falsification", hce_plan.falsification.reason,
+                        s_hat=hce_estimate.s_hat, s_ref=hce_s_ref, se=hce_estimate.se)
+                else:
+                    hce_estimate, hce_decision = hce_runtime.score_iteration(
+                        plan=hce_plan, measured=hce_measured, s_ref=hce_s_ref, config=config)
+
+                print(f"[hce] estimate: mean@k={hce_estimate.s_hat:.4f} "
+                      f"(hajek {hce_estimate.s_hajek:.4f}, se {hce_estimate.se:.4f}"
+                      f"{', conservative' if hce_estimate.se_is_conservative else ''}) "
+                      f"vs reference "
+                      f"{'none' if hce_s_ref is None else format(hce_s_ref, '.4f')}"
+                      f"; measured {hce_estimate.n_measured}/{hce_estimate.n_selected}"
+                      + (f", {hce_estimate.n_dropped_infra} lost to infrastructure"
+                         if hce_estimate.n_dropped_infra else ""))
+                print(f"[hce] gate: {hce_decision.verdict.upper()} "
+                      f"[{hce_decision.rule}] {hce_decision.reason}")
+
+                if bool(hce_cfg["gate"]["enabled"]) and not hce_decision.accepted:
+                    revert_tag = f"iteration_{iteration - 1}_before"
+                    try:
+                        sha = hce_gate.revert_to(workspace_dir, revert_tag,
+                                                 reason=hce_decision.rule,
+                                                 iteration=iteration - 1)
+                        hce_decision.reverted_to = revert_tag
+                        hce_decision.revert_commit = sha
+                        print(f"[hce] reverted workspace to {revert_tag} ({sha[:8]})")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[hce] git revert failed ({exc}); falling back to snapshot")
+                        best_iter = (load_best_ever(exp_dir) or {}).get("iteration")
+                        if best_iter:
+                            perform_auto_rollback(exp_dir, workspace_dir, int(best_iter))
+
+                accepted = hce_decision.accepted or not bool(hce_cfg["gate"]["enabled"])
+                hce_runtime.commit_measurements(
+                    db=hce_db, measured=hce_measured, iteration=iteration,
+                    fingerprint=hce_plan.record.get("fingerprint", ""), accepted=accepted,
+                    is_profiling=bool(hce_plan.record.get("is_profiling")),
+                    k=exp_k, job_dir=str(job_dir))
+                if accepted:
+                    hce_s_ref = hce_estimate.s_hat
+                hce_runtime.write_json(hce_iter_dir / "estimate.json", hce_estimate.to_dict())
+                hce_runtime.write_json(hce_iter_dir / "gate.json", hce_decision.to_dict())
+                # The estimate, not the subset pass rate, is the comparable
+                # number: a subset mean is over whichever tasks were selected.
+                stats["global_estimate"] = hce_estimate.s_hat
+                stats["subset_pass_rate"] = stats["pass_rate"]
+                stats["hce_selector"] = hce_plan.record["selector"]
+                stats["hce_mode"] = hce_plan.record["mode"]
+                stats["hce_budget_rollouts"] = hce_plan.record["budget_rollouts"]
+                stats["hce_se"] = round(hce_estimate.se, 6)
+                stats["hce_gate_verdict"] = hce_decision.verdict
+                stats["hce_gate_rule"] = hce_decision.rule
+                stats["hce_n_dropped_infra"] = hce_estimate.n_dropped_infra
+
             # Phase 2.8: Update best-ever
             best_ever = update_best_ever(exp_dir, iteration, stats)
 
-            target_metric = stats["pass_rate"]
+            target_metric = stats.get("global_estimate", stats["pass_rate"])
             if target_metric >= target_pass_rate:
                 _iter_timing["total_min"] = round((time.monotonic() - _iter_start) / 60, 1)
                 update_iteration_scores(exp_dir, config, iteration, pass_rate, n_pass, n_total, job_dir,
@@ -4597,6 +5086,8 @@ def run_single_experiment(config: dict, config_path: str, experiment_name: str |
 
     # Post-evolve validation
     run_post_evolve(config, exp_dir, workspace_dir, agent_config_filename)
+
+    write_cost_summary(exp_dir)
 
     # Final summary
     scores_path = exp_dir / "iteration_scores.yaml"

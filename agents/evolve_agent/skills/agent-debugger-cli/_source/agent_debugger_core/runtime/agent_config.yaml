@@ -71,4 +71,8 @@ middlewares:
       compaction_strategy: "tool_result_compaction"
       keep_iterations: 10
 
-tracers: []
+tracers:
+  - import: agent_debugger_core.runtime.usage_tracer:UsageTracer
+    params:
+      role: agent_debugger
+

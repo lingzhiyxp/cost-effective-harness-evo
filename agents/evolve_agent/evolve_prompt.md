@@ -211,11 +211,48 @@ The `iteration` field below MUST be `{{ iteration }}` (the current loop — the 
       "predicted_fixes": ["task-name-a", "task-name-b"],
       "risk_tasks": ["task-name-c"],
       "constraint_level": "middleware|tool_impl|tool_desc|skill|prompt",
-      "why_this_component": "Why this component level was chosen over alternatives"
+      "why_this_component": "Why this component level was chosen over alternatives",
+      "evaluation_contract": {
+        "scope": "conditional",
+        "mechanism": "One sentence: what this change does, at runtime, that a task could observe",
+        "activation_predicate": {"max_command_output_tokens": ">2000"},
+        "expected_effect": "improve|neutral|mixed"
+      }
     }
   ]
 }
 ```
+
+### evaluation_contract
+
+Every change must declare the condition under which it does anything. Only tasks
+whose recorded behaviour satisfies that condition are evaluated, so this is what
+decides how your change gets measured.
+
+- `activation_predicate` is a flat object. Keys are ANDed. Each value is `true`,
+  `false`, a number, or a comparison string such as `">2000"`, `">=10"`, `"<50"`.
+  There is no `or` and no nesting: a change with two independent triggers is two
+  changes, each with its own predicate.
+- Keys must come from the table below. An unknown key is a hard error and the
+  iteration is rejected before anything runs.
+- Set `"scope": "global"` and omit the predicate when the change affects every
+  task regardless of behaviour. Editing a globally visible file forces global
+  scope whether or not you declare it.
+
+Two ways to get rejected without a single task being run:
+
+1. **A predicate your own claims contradict.** If `predicted_fixes` names a task
+   whose recorded profile does not satisfy your `activation_predicate`, the
+   change cannot work by the mechanism you stated, and it is rejected.
+2. **A predicate that matches nothing.** Then no evidence about the change can
+   be gathered, and it is rejected as unverifiable.
+
+So choose thresholds against the observed column below, not from intuition. A
+threshold above the observed maximum selects nothing.
+
+#### Legal predicate keys, with what was actually recorded
+
+<!-- HCE_FEATURE_TABLE -->
 
 ## Validation
 
